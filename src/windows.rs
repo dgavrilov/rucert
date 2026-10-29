@@ -11,11 +11,12 @@ use std::process::ExitCode;
 
 use sha1::{Digest, Sha1};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED};
+use windows_sys::Win32::System::Console::GetConsoleWindow;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 use windows_sys::Win32::UI::Shell::{
     SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, SW_HIDE};
 use winreg::RegKey;
 use winreg::enums::{
     HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, KEY_WOW64_32KEY,
@@ -168,6 +169,34 @@ pub fn run_elevated_command() -> Option<ExitCode> {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     })
+}
+
+/// `console` draws Unicode glyphs on Windows only when `WT_SESSION` is set, and Windows
+/// Terminal does not set it for a console it takes over as the default terminal (e.g. a
+/// double-clicked exe). Consoles hosted through ConPTY, Windows Terminal included, have a
+/// hidden window of class `PseudoConsoleWindow`; for those, `WT_SESSION` is set here.
+///
+/// Must run before any other thread starts, as it modifies the environment.
+pub fn enable_unicode_in_pseudo_console() {
+    if std::env::var_os("WT_SESSION").is_some() {
+        return;
+    }
+    // SAFETY: takes no arguments; returns null when the process has no console.
+    let window = unsafe { GetConsoleWindow() };
+    if window.is_null() {
+        return;
+    }
+    let mut class = [0u16; 32];
+    // SAFETY: `window` is a console window handle and the buffer length is passed with it.
+    let len = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
+    let class = &class[..usize::try_from(len).unwrap_or(0)];
+    if OsStr::new("PseudoConsoleWindow")
+        .encode_wide()
+        .eq(class.iter().copied())
+    {
+        // SAFETY: the caller guarantees no other thread reads or writes the environment.
+        unsafe { std::env::set_var("WT_SESSION", "1") };
+    }
 }
 
 /// Arguments and the settings file come from the unelevated side, so both are checked

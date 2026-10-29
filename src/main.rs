@@ -20,6 +20,8 @@ fn main() -> std::process::ExitCode {
     if let Some(code) = windows::run_elevated_command() {
         return code;
     }
+    #[cfg(windows)]
+    windows::enable_unicode_in_pseudo_console();
     // The wizard writes to stderr; frame it with one blank line on each side.
     eprintln!();
     let outcome = wizard::run();
