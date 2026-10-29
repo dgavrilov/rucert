@@ -37,6 +37,11 @@ const BAR: Emoji = Emoji("│", "|");
 const BULLET: Emoji = Emoji("•", "*");
 const ARROW: Emoji = Emoji("→", "->");
 
+/// Domains printed before a long list is cut short; the full list is in the search.
+const PREVIEW_ROWS: usize = 10;
+/// Visible rows of scrollable domain prompts.
+const LIST_ROWS: usize = 12;
+
 /// Default cliclack theme with localized Yes/No labels and readable (non-dimmed)
 /// note bodies and submitted answers.
 struct WizardTheme;
@@ -194,11 +199,19 @@ fn marked_domain_list(domains: &[String], marker: &impl std::fmt::Display) -> St
     if domains.is_empty() {
         return format!("  {}", style(t!("common.none")).dim());
     }
-    domains
+    let mut lines: Vec<String> = domains
         .iter()
+        .take(PREVIEW_ROWS)
         .map(|domain| format!("  {marker} {}", domains::display(domain)))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    if domains.len() > PREVIEW_ROWS {
+        let rest = domains.len() - PREVIEW_ROWS;
+        lines.push(format!(
+            "  {}",
+            style(t!("domains.more", count = rest)).dim()
+        ));
+    }
+    lines.join("\n")
 }
 
 fn status(settings: &Settings) -> Result {
@@ -257,6 +270,7 @@ fn status(settings: &Settings) -> Result {
             "status.lists",
             version = curated.version,
             count = curated.domains.len(),
+            excluded = curated.domains.len() - settings.enabled_curated().count(),
             custom = settings.custom_domains.len()
         ),
         heading(t!("status.browsers")),
@@ -395,7 +409,9 @@ fn hand_over(selected: &[&Browser], _domains: &[String]) -> Result<bool> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DomainAction {
+    Browse,
     Add,
+    Curated,
     Remove,
     Back,
 }
@@ -408,16 +424,26 @@ fn manage_domains(settings: &mut Settings) -> Result {
         note(
             t!("domains.title"),
             format!(
-                "{}\n{}\n\n{}\n{}",
-                heading(t!("domains.curated", version = curated.version)),
-                domain_list(&curated.domains),
+                "{}\n\n{}\n{}",
+                heading(t!(
+                    "domains.curated",
+                    version = curated.version,
+                    enabled = settings.enabled_curated().count(),
+                    total = curated.domains.len()
+                )),
                 heading(t!("domains.custom")),
                 domain_list(&settings.custom_domains),
             ),
         )?;
 
-        let mut prompt =
-            select(t!("domains.prompt")).item(DomainAction::Add, t!("domains.add"), "");
+        let mut prompt = select(t!("domains.prompt"))
+            .item(
+                DomainAction::Browse,
+                t!("domains.browse"),
+                t!("domains.browse_hint"),
+            )
+            .item(DomainAction::Add, t!("domains.add"), "")
+            .item(DomainAction::Curated, t!("domains.choose_curated"), "");
         if !settings.custom_domains.is_empty() {
             prompt = prompt.item(DomainAction::Remove, t!("domains.remove"), "");
         }
@@ -431,7 +457,9 @@ fn manage_domains(settings: &mut Settings) -> Result {
             Err(e) => return Err(e.into()),
         };
         let outcome = match action {
+            DomainAction::Browse => browse_domains(settings),
             DomainAction::Add => add_domain(settings),
+            DomainAction::Curated => choose_curated(settings),
             DomainAction::Remove => remove_domains(settings),
             DomainAction::Back => break,
         };
@@ -447,6 +475,42 @@ fn manage_domains(settings: &mut Settings) -> Result {
     Ok(())
 }
 
+/// Read-only list of every known domain with its state; typing filters it.
+fn browse_domains(settings: &Settings) -> Result {
+    let mut entries: Vec<(&String, String)> = settings
+        .curated()
+        .domains
+        .iter()
+        .map(|domain| {
+            let kind = if settings.excluded_domains.contains(domain) {
+                style(t!("domains.kind_excluded")).yellow().to_string()
+            } else {
+                t!("domains.kind_curated").into_owned()
+            };
+            (domain, kind)
+        })
+        .chain(
+            settings
+                .custom_domains
+                .iter()
+                .map(|domain| (domain, t!("domains.kind_custom").into_owned())),
+        )
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut prompt = select(t!("domains.browse_prompt", count = entries.len()))
+        .filter_mode()
+        .max_rows(LIST_ROWS);
+    for (index, (domain, kind)) in entries.iter().enumerate() {
+        prompt = prompt.item(index, domains::display(domain), kind);
+    }
+    match prompt.interact() {
+        // Nothing to do with the choice: Enter and Esc both just close the list.
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn add_domain(settings: &mut Settings) -> Result {
     let raw: String = input(t!("domains.add_prompt"))
         .placeholder(&t!("domains.add_placeholder"))
@@ -457,6 +521,13 @@ fn add_domain(settings: &mut Settings) -> Result {
         })
         .interact()?;
     let domain = domains::normalize(&raw)?;
+    // An excluded main-list domain is switched back on rather than duplicated as custom.
+    if settings.curated().domains.contains(&domain) && settings.excluded_domains.contains(&domain) {
+        settings.excluded_domains.retain(|d| *d != domain);
+        save(settings);
+        log::success(t!("domains.included", domain = domains::display(&domain)))?;
+        return Ok(());
+    }
     match domains::covered_by(&domain, &settings.effective_domains()) {
         Some(entry) if *entry == domain => {
             log::warning(t!("domains.exists", domain = domains::display(&domain)))?;
@@ -479,13 +550,56 @@ fn add_domain(settings: &mut Settings) -> Result {
     Ok(())
 }
 
+/// Checkbox list of the main list: unchecked domains are excluded from the policies.
+fn choose_curated(settings: &mut Settings) -> Result {
+    let curated = settings.curated().domains.clone();
+    let mut prompt = multiselect(t!("domains.choose_curated_prompt"))
+        .required(false)
+        .filter_mode()
+        .max_rows(LIST_ROWS)
+        .initial_values(settings.enabled_curated().cloned().collect());
+    for domain in &curated {
+        prompt = prompt.item(domain.clone(), domains::display(domain), "");
+    }
+    let enabled: BTreeSet<String> = prompt.interact()?.into_iter().collect();
+    if enabled.is_empty() && settings.custom_domains.is_empty() {
+        log::warning(t!("domains.empty_list"))?;
+        return Ok(());
+    }
+    let excluded: Vec<String> = curated
+        .iter()
+        .filter(|domain| !enabled.contains(*domain))
+        .cloned()
+        .collect();
+    if excluded == settings.excluded_domains {
+        return Ok(());
+    }
+    settings.excluded_domains = excluded;
+    save(settings);
+    log::success(t!(
+        "domains.curated_saved",
+        enabled = enabled.len(),
+        total = curated.len()
+    ))?;
+    Ok(())
+}
+
 fn remove_domains(settings: &mut Settings) -> Result {
-    let mut prompt = multiselect(t!("domains.remove_prompt")).required(false);
+    let mut prompt = multiselect(t!("domains.remove_prompt"))
+        .required(false)
+        .filter_mode()
+        .max_rows(LIST_ROWS);
     for domain in &settings.custom_domains {
         prompt = prompt.item(domain.clone(), domains::display(domain), "");
     }
     let to_remove = prompt.interact()?;
     if to_remove.is_empty() {
+        return Ok(());
+    }
+    if settings.enabled_curated().next().is_none()
+        && to_remove.len() == settings.custom_domains.len()
+    {
+        log::warning(t!("domains.empty_list"))?;
         return Ok(());
     }
     settings.custom_domains.retain(|d| !to_remove.contains(d));

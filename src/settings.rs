@@ -44,6 +44,10 @@ pub struct Settings {
     /// Curated list downloaded from GitHub.
     #[serde(default)]
     pub downloaded: Option<ConstraintSet>,
+    /// Main-list domains the user turned off. Kept by name, so they stay off after a list
+    /// update that still contains them.
+    #[serde(default)]
+    pub excluded_domains: Vec<String>,
     /// [`Browser::id`](crate::browsers::Browser::id)s the policies were last applied to;
     /// empty when not installed. The name predates Windows support and is kept for
     /// compatibility with existing settings files.
@@ -103,6 +107,14 @@ impl Settings {
             }
         }
         self.custom_domains = custom.into_iter().collect();
+        // An entry that fails validation cannot match a (validated) main-list domain, so
+        // dropping it changes nothing.
+        self.excluded_domains = std::mem::take(&mut self.excluded_domains)
+            .iter()
+            .filter_map(|domain| domains::normalize(domain).ok())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         if let Some(downloaded) = self.downloaded.take() {
             match downloaded.validated() {
                 Ok(valid) => self.downloaded = Some(valid),
@@ -127,11 +139,17 @@ impl Settings {
         }
     }
 
-    /// Curated plus custom domains, sorted and deduplicated.
-    pub fn effective_domains(&self) -> Vec<String> {
+    /// Main-list domains not turned off by the user.
+    pub fn enabled_curated(&self) -> impl Iterator<Item = &String> {
         self.curated()
             .domains
             .iter()
+            .filter(|domain| !self.excluded_domains.contains(domain))
+    }
+
+    /// Enabled main-list plus custom domains, sorted and deduplicated.
+    pub fn effective_domains(&self) -> Vec<String> {
+        self.enabled_curated()
             .chain(&self.custom_domains)
             .cloned()
             .collect::<BTreeSet<_>>()
@@ -176,7 +194,22 @@ mod tests {
         };
         let effective = settings.effective_domains();
         assert_eq!(effective.len(), curated.len() + 1);
-        assert_eq!(effective[0], "aaa-custom.ru");
+        assert!(effective.contains(&"aaa-custom.ru".to_owned()));
+        assert!(effective.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn effective_domains_skip_excluded_unless_added_as_custom() {
+        let curated = &ConstraintSet::embedded().domains;
+        let settings = Settings {
+            excluded_domains: vec![curated[0].clone(), curated[1].clone()],
+            custom_domains: vec![curated[1].clone()],
+            ..Default::default()
+        };
+        let effective = settings.effective_domains();
+        assert_eq!(effective.len(), curated.len() - 1);
+        assert!(!effective.contains(&curated[0]));
+        assert!(effective.contains(&curated[1]));
     }
 
     /// A hand-edited file must not smuggle trust-widening entries into the profile.

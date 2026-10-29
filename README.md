@@ -105,7 +105,10 @@ from the system locale) and remembers it. Main menu:
   including removing them from browsers that are no longer selected; the selected browsers
   are remembered.
 
-- **Manage domains**: add or remove your own domains on top of the main list.
+- **Manage domains**: browse and search all domains (typing filters the list), exclude
+  domains of the main list, add or remove your own domains on top of it. Exclusions are kept
+  by name, so they survive list updates; adding an excluded domain enables it again. At least
+  one domain must remain. Long lists elsewhere in the wizard show only the first entries.
   Wildcards, top-level domains and IP addresses are rejected; internationalized names are
   converted to punycode. When you leave this menu with changes, the policies are applied again
   to the remembered browsers.
