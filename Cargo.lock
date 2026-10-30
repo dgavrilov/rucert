@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "rucert"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "base64",
  "cliclack",
